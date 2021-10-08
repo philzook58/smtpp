@@ -1,26 +1,7 @@
 open Core
 
-(* args-equal and retvals-equal *)
-let def_pto_stack env =
-  let pointer_sort = get_pointer_sort env in
-  let x = Z3.Expr.mk_fresh_const (Env.get_context env) "x" pointer_sort in
-  define_fun "pto-stack"  [sexp_of_expr x, sexp_of_sort pointer_sort] (sexp_of_expr (Env.in_stack env x))
-  let mem_sort dom cod = Sexp.List [Sexp.Atom "Array"; dom ; cod ]
-  let bv_sort_of_var (v : Var.t) : Sexp.t =
-    let typ = Var.typ v in
-    match typ with
-    | Imm w -> bv_sort w
-    | Type.Mem (i_size, w_size) -> mem_sort
-                        (bv_sort (Size.in_bits i_size))
-                        (bv_sort (Size.in_bits w_size))
-    | Unk -> failwith "bv_sort_of_var: Unrecognized sort type"
 
-    let bv_sort width = Sexp.List [
-      Sexp.Atom "_";
-      Sexp.Atom "BitVec";
-      Sexp.Atom (Int.to_string width);
-      ]
-    
+
 let bv_sort (width : int) : Sexp.t =  Sexp.List
   [
     Sexp.Atom "_";
@@ -78,6 +59,14 @@ let macro_run (macros : macro String.Map.t) (sexp : Sexp.t) :
   in
   worker sexp
 
+let gensym = let counter = ref 0 in
+  fun prefix ->
+    let i = !counter in
+    counter := i + 1;
+    Sexp.Atom ("__" ^ prefix ^ (string_of_int i))
+
+
+
 let binop (op_str : string) : (string, string) Result.t =
   match op_str with
   | "+" -> Ok "bvadd"
@@ -107,7 +96,314 @@ let macro0 name (sexp_str : string) : string * macro =
 
 (* This might as well not be a macro. *)
 
+(* let quasiquote s = Format.sprintf s *)
 
+let let_ v e body = 
+  Sexp.List [ Sexp.Atom "let"; Sexp.List [Sexp.List [ v; e ]] ; body ]
+
+let fun1 name = fun x -> Sexp.List [Sexp.Atom name; x]
+let fun2 name = fun x y -> Sexp.List [Sexp.Atom name; x; y]
+let fun3 name = fun x y z -> Sexp.List [Sexp.Atom name; x; y; z]
+
+let not_ = fun1 "not"
+let and_ = fun2 "and"
+
+let impl = fun2 "=>"
+let ite = fun3 "ite"
+let false_ = Sexp.Atom "false"
+let true_ = Sexp.Atom "true"
+
+let assert_ = fun1 "assert"
+
+let forall = fun2 "forall"
+
+
+let command c = Sexp.List [Sexp.Atom c]
+let push = command "push"
+let pop = command "pop"
+let check_sat = command "check-sat"
+let echo = fun1 "echo"
+(*
+let ($) f x = Sexp.List [ f ; x ]
+*)
+
+(*
+(define-method )
+
+The expressions of our language are literally smtlib expressions.
+
+
+*)
+
+(*
+
+validate anything I expect to be a valid smtlib expression using an smtlib library.
+
+*)
+
+type method_ = {
+  pre : Sexp.t;
+  post : Sexp.t;
+  args : Sexp.t list
+}
+
+(* Method registry is populated for the use of calling methods frtom other methods. *)
+let method_registry : (string, method_) Hashtbl.t = Hashtbl.create (module String)
+let register_method name ~args ~pre ~post : unit = Hashtbl.set ~key:name ~data:{pre; post; args} method_registry
+
+(*
+right hand side of on assignment may contain 
+*)
+
+let tuple_of_sexp sexp =
+  match sexp with
+  | Sexp.List [a; b] -> (a,b)
+  | _ -> failwith "unexpected form in tuple_of_sexp"
+
+let alist_of_sexp args = List.map args ~f:tuple_of_sexp
+
+let get_atom s = match s with
+   | Sexp.Atom a -> a
+   | _ -> failwith "used get_atom on non atom"
+
+
+let rec wp_stmt s : Sexp.t -> Sexp.t = 
+  match s with
+  | Sexp.List (Sexp.Atom stmt :: args) ->
+     (match stmt, args with
+     | "skip", [] -> fun post -> post
+     | "abort", [] -> fun _post -> false_
+     | "assert", [q] -> fun post -> and_ q post
+     | "assume", [q] -> fun post -> impl q post
+     | "set", [v; e] -> fun post -> let_ v e post
+     | "if", [c; t; e] -> fun post -> and_ (impl c (wp_stmt t post)) (impl (not_ c) (wp_stmt e post))
+     | "when", [c; body] -> wp_stmt (if_  c body skip_) (* fun post -> and_ (impl c (wp_stmt body post)) (impl (not_ c) post) *)
+     | "while", c :: i :: body -> fun post ->
+           and_ i
+          (and_ (impl (and_ i c) (wp_stmts body i))
+               (impl (and_ i (not_ c)) post))
+     
+    (* | "cond"
+     | "progn"  ->
+     | "return" ->
+     | "tagbody" ->
+     | "go" -> *)
+     | _ ->
+        match Hashtbl.find method_registry stmt with
+        | None -> failwith "unmatched stmt form"
+        | Some {f_args; pre; post} ->
+           (* let args' = List.map ~f:gensym args' in *)
+           let rebind p = let_ (List.map2_exn ~f:sexp_of_tuple f_args args) p in
+            wp_stmts [
+              assert_ (rebind pre);
+              assume_ (rebind post);
+            ]
+
+     (* | "if", [c; t] -> fun post -> and_ (impl c (wp_stmt t)) (impl (not_ c) post)   *) 
+     )
+  | _ -> failwith "unmatched stmt"
+and wp_stmts stmts = fun post -> List.fold_right stmts ~init:post ~f:(fun s post -> wp_stmt s post)
+
+let prog stmts = 
+  Ok (assert_ (List.fold_right stmts ~init:true_ ~f:(fun s post -> wp_stmt s post )))
+
+
+let rec subst key e sexp =
+  match sexp with
+  | Sexp.Atom a -> if String.(a = key) then e else sexp
+  | Sexp.List xs -> 
+      match xs with
+      | Sexp.Atom "let" :: args :: body -> 
+      | _ -> List.map ~f:(subst key e) xs
+
+
+let keyword_args args : Sexp.t String.Map.t * Sexp.t list =
+ let rec worker keymap posargs args =
+  match args with
+  | [] -> keymap, posargs
+  | x :: xs -> match x with
+              | Sexp.Atom k -> begin
+                    if Char.equal (String.get k 0) ':' then
+                        match xs with
+                        | v :: xs -> worker (String.Map.set keymap ~key:k ~data:v) posargs xs
+                        | [] -> failwith (sprintf "expected keyword argument after %s" k)
+                        else worker keymap (x :: posargs) xs
+
+                    end
+              | _ -> worker keymap (x :: posargs) xs
+                  in
+  let (keymap, args) = worker String.Map.empty [] args in
+  (keymap, List.rev args)
+
+
+
+
+(*
+defines function with
+pre and post conditions
+and termination.
+
+
+smtlib supports a couple quantifiers, but the most overlooked and extremely useful one is let bindings.
+Programmatic interfaces tend to not even expose let bindings.
+Let bindings are frozen substitution. They allow metaprogramming of smtlib expression to let the smt solver itslef perform substitions. 
+This allows shared subexpressions, and lets the produced smtlib term more closesly reflect the strucutre of the original input.
+
+The weakest precondition for assignment and function calls? is much prettier if you allow yourself `let`.
+
+*)
+let define_function = ()
+
+(*
+Any houdini style annotation guesses can be input as or expressions.
+*)
+(*
+
+Sexp.t -> (Sexp.t, string) Result
+
+lift f = fun anno_sexp -> Annotated.get_sexp anno_sexp |> f
+Sexp.Annotated.
+
+differentiation as a metalevel construct
+I guess the most natural thing to do is defunctionlwize if I need to internalize differentiation.
+
+  I can't reuse the interpeted + * operations?
+  Z3 may not ematch on them so I can inject into them but hard to return
+  
+  (diff sin)
+
+(*
+defunctionalized pairs and their implementation.
+Inject these defininig axioms
+*)
+let defunc_table = 
+
+diff(sin) = cos
+comp( sin, cos ) = fmul( comp(neg,comp(cos,sin)), )
+
+apply(fmul(a,b), x) <-> apply(a,x) * apply(b,x)
+
+minimal number of uses of such and such a symbol. (integration sign in this case)
+
+
+
+let deriv args = match args with
+  | "sin" -> neg_ cos_
+  | "cos" -> sin_
+  | "exp" -> exp_
+  | "mul" [] -> zero_
+  | "mul" a :: b ->
+  | "add" ->
+
+The first goal should be to verify invariants of differential equations.
+Everything is specified. In principle it is a mechanical prcoedure without require much smarts.
+
+*)
+let define_method (args : Sexp.t list) : Sexp.t list =
+  let keyargs, args = keyword_args args in
+  let pre = Option.value ~default:true_ (String.Map.find keyargs ":pre") in
+  let post = Option.value ~default:true_ (String.Map.find keyargs ":post") in
+  match args with
+  | (Sexp.Atom name) :: vars :: body ->
+    let () = register_method name ~args ~pre ~post in
+    let post' = wp_stmts body post in
+    let vc = (forall vars (impl pre post')) in
+      [
+        echo (Sexp.Atom (sprintf "verifying %s" name));
+        push;
+        assert_ vc;
+        check_sat;
+        pop;
+      ]
+  | _ -> (Format.printf "missing necessary parameters to defmethod %a" (Format.pp_print_list Sexp.pp_hum) args); failwith "foo"
+
+(*
+
+So it is real easy to fuck stuff up.
+Keyword arguments might help a little.
+But also, error reporting to lines.
+
+
+*)
+
+let macros' = String.Map.of_alist_exn [
+  "define-method" , define_method
+  ]
+
+let apply_macro' s = 
+ match s with
+ | Sexp.List ((Sexp.Atom m) :: xs) -> (match String.Map.find macros' m with
+                          | Some f -> f xs
+                          | None -> [s])
+ | _ -> [s]
+
+let macros = String.Map.of_alist_exn [
+  "prog" , prog  
+  ]
+(*  mem_equiv_start; *)
+
+(*
+Hmm.
+Sexp.t is my master type
+
+Maybe it does make sense to do this finally tagless.
+
+
+Making a refinement interpreter seems cool too.
+F* style?
+Trying to do smtlib3?
+(the x type) seems standard
+(deftype )
+
+I could also possibly call z3?
+Automatic defunctionalization?
+
+
+*)
+
+module Interpreter = struct 
+
+end
+
+module MySexp = struct
+  (*
+  
+  It may be desirable to make my own sexp so I havbe deeper control over formatting.
+  In addition, I could do my sexp smtlib compliant in regards to quoting.
+
+  type t = Comment of | Sexp of Sexp.t doesn't work.
+  *)
+  type t = Atom of string | List of t list | Comment of string
+  (* just strip out the comments. *)
+  let of_sexp = ()
+  let to_sexp = () 
+end
+
+let run filename =
+  let file = In_channel.create filename in
+  let sexps = Sexp.input_sexps file in
+  (* let res = List.map ~f:(macro_run macros) sexps |> Result.all in *)
+  let res = List.concat_map ~f:apply_macro' sexps in
+  Format.printf "%a\n" (Format.pp_print_list Sexp.pp_hum) res
+  (* match res with
+  | Error s -> Format.printf "Error: %s" s
+  | Ok sexps ->
+      Format.printf "%a\n" (Format.pp_print_list Sexp.pp_hum) sexps *)
+
+let filename_param =
+  let open Command.Param in
+  anon ("filename" %: string)
+
+let command =
+  Command.basic ~summary:"Apply Macros to an SMTLIB file"
+    ~readme:(fun () -> "More detailed information")
+    (Command.Param.map filename_param ~f:(fun filename () -> run filename))
+
+let () = Command.run ~version:"1.0" ~build_info:"RWO" command
+
+
+
+(*
 let bounded_forall_macro var start end' body =
   let let_form i =
     Sexp.List
@@ -146,6 +442,7 @@ let bv_sort width =  Sexp.List
   Sexp.Atom "BitVec";
   Sexp.Atom (Int.to_string width);
 ]
+(*
 (* TODO: concat full size. init mod, orig *)
 let struct_accessors (si : struct_info) : Sexp.t list =
   List.map si.fields ~f:(fun fi ->
@@ -162,7 +459,9 @@ let struct_setters (si : struct_info) : Sexp.t list =
     let body = store (Sexp.Atom "mem") (bvadd (Sexp.Atom "p") (bv fi.offset 64)) in
     define_fun name args (bv_sort 8) body
     )
+*)
 
+*)
 
 (*
 An alternative
@@ -248,30 +547,32 @@ let c_expr = ()
 
 *)
 
-let macros = String.Map.of_alist_exn [ (*  mem_equiv_start; *) ]
 
-let run filename =
-  let prelude_chan = In_channel.create "test.smt2" in
-  let prelude_sexp = Sexp.input_sexps prelude_chan in
-  let file = In_channel.create filename in
-  let sexp = Sexp.input_sexp file in
-  match macro_run macros sexp with
-  | Error s -> Format.printf "Error: %s" s
-  | Ok sexp ->
-      Format.printf "%a\n%a"
-        (Format.pp_print_list Sexp.pp_hum)
-        prelude_sexp Sexp.pp_hum sexp
 
-let filename_param =
-  let open Command.Param in
-  anon ("filename" %: string)
+(*
 
-let command =
-  Command.basic ~summary:"Apply Macros to an SMTLIB file"
-    ~readme:(fun () -> "More detailed information")
-    (Command.Param.map filename_param ~f:(fun filename () -> run filename))
+(* args-equal and retvals-equal *)
+let def_pto_stack env =
+  let pointer_sort = get_pointer_sort env in
+  let x = Z3.Expr.mk_fresh_const (Env.get_context env) "x" pointer_sort in
+  define_fun "pto-stack"  [sexp_of_expr x, sexp_of_sort pointer_sort] (sexp_of_expr (Env.in_stack env x))
+  let mem_sort dom cod = Sexp.List [Sexp.Atom "Array"; dom ; cod ]
+  let bv_sort_of_var (v : Var.t) : Sexp.t =
+    let typ = Var.typ v in
+    match typ with
+    | Imm w -> bv_sort w
+    | Type.Mem (i_size, w_size) -> mem_sort
+                        (bv_sort (Size.in_bits i_size))
+                        (bv_sort (Size.in_bits w_size))
+    | Unk -> failwith "bv_sort_of_var: Unrecognized sort type"
 
-let () = Command.run ~version:"1.0" ~build_info:"RWO" command
+    let bv_sort width = Sexp.List [
+      Sexp.Atom "_";
+      Sexp.Atom "BitVec";
+      Sexp.Atom (Int.to_string width);
+      ]
+    
+*)
 
 (* 
 
